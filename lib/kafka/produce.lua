@@ -4,7 +4,7 @@ local encode = require "kafka.encode"
 local new_tab = require "table.new"
 local zstandard = require "kafka.zstd"
 local response = require "kafka.response".new{
-	"array:response", {
+	"array:response", { 
 		"string:topic",
 		"array:partition", {
 			"int32:id",
@@ -17,11 +17,27 @@ local response = require "kafka.response".new{
 	}
 }
 
+
 local concat = table.concat
 local char = string.char
+local byte = string.byte
 
 local _M = { _VERSION = 0.1 }
 local mt = { __index = _M }
+
+_M.stats = {
+  --[[
+  ["topic"] = {
+    npackets = int,
+    nbytes = int, -- uncompressed
+    comprate
+    
+    nrecords = int,
+
+    overflows = int, -- forced batch clear
+  }
+  --]]
+}
 
 local zstd -- must be initialized per worker (on add)
 local record = { [2] = char(0x00), [5] = char(0x01) } -- attributes, key_len
@@ -51,10 +67,13 @@ function _M.new(config)
 		max_timeout            = config.max_timeout or 2000,
 		zstd_compression_level = config.zstd_compression_level or 9,
 
-		offset = 8
+		offset = 8,
+    error_code_offset      = 4 + 4 + 2 + #config.topic + 4 + 4,
+
+    navg_samples      = config.navg_samples or 100
 	}
 
-	local request_header, produce_header, record_batch_header = {
+	local request_header, produce_header = {
 		char(0x00, 0x00),                    -- api_key
 		char(0x00, 0x07),                    -- api_version
 		char(0,0,0,0),                       -- correlation_id
@@ -64,12 +83,6 @@ function _M.new(config)
 		encode.int16(self.required_acks),    -- required_acks
 		encode.int32(self.timeout),          -- timeout
 		encode.int32(1),                     -- number of topics
-	}, {
-		encode.int64(0),                     -- offset
-		encode.int32(0),                     -- size in bytes
-		encode.int32(-1),                    -- partition leader epoch
-		char(0x02),                          -- magic
-		encode.int32(0),                     -- crc32c
 	}
 
 	-- (request_header) + (produce_header)
@@ -112,12 +125,22 @@ function _M.new(config)
 		}
 	end
 
+  _M.stats[self.topic] = _M.stats[self.topic] or {
+    npackets = 0,
+    nbytes = 0,
+    nrecords = 0
+  }
+  self.s = _M.stats[self.topic]
+
 	return setmetatable(self, mt)
 end
 
 
 function _M:send()
 	local record_batch = self.record_batch
+
+	local idx = record_batch.length + self.offset
+  record_batch[idx + 1], record_batch[idx + 2] = zstd:finalize()
 
 	if record_batch.lock then -- TODO: possible to end here?
 		ngx.log(ngx.ERR, "record_batch is locked:", record_batch.id)
@@ -135,6 +158,12 @@ function _M:send()
 
 	local size = #data + 9                    -- record batch header
 
+  -- compression rate
+  local x = self.navg_samples
+  local comprate = record_batch.size / (size - 40) / x
+  self.s.comprate = self.s.comprate or comprate * x
+  self.s.comprate = self.s.comprate / x * (x - 1) + comprate
+
 	pkt[01] = encode.int32(size + 12 + self.header_length)
 	pkt[06] = encode.int32(0)                 -- partition_id
 	pkt[07] = encode.int32(size + 12)         -- messageset size
@@ -143,37 +172,70 @@ function _M:send()
 	pkt[13] = data
 
 	ngx.timer.at(0, function(premature, record_batch)
-		local data, err = self.client:send(record_batch.pkt, 0)
-		if data then
-			ngx.log(ngx.ERR, require"cjson".encode(response(data)))
-		else
-			ngx.log(ngx.ERR, err)
+    local data, err
+    for i=1, 2 do
+      data, err = self.client:send(record_batch.pkt, 0, i==2)
+
+      if not data then
+        if err then
+          self.s[err] = (self.s[err] or 0) + 1
+        end
+        break
+      end
+
+      local err_code = byte(data, self.error_code_offset+2)
+
+      if not (i == 1 and err_code == 6) then
+        err = err_code ~= 0 and err_code
+        break
+      end
 		end
 
-		record_batch.length, record_batch.lock = 0, nil
+    if err then
+      ngx.log(ngx.ERR, err)
+      --ngx.log(ngx.ERR, require"cjson".encode(response(data)))
+    end
+    self.s.npackets = self.s.npackets + 1
+    self.s.nbytes   = self.s.nbytes + record_batch.size
+    self.s.nrecords = self.s.nrecords + record_batch.length
+
+		record_batch.length, record_batch.lock = 0
 	end, record_batch)
 
-	record_batch = record_batch.next
-	if record_batch.length > 0 then -- not empty
-		if record_batch.first_timestamp + self.max_timeout <= ngx.now() then
-			record_batch.length, record_batch.lock = 0, nil
-		else
-			return nil, "no free buffers"
-		end
-	end
 
-	record_batch.size, self.record_batch = 0, record_batch
 
-	return record_batch
+  self.record_batch = record_batch.next
+  return true
 end
 
 
 function _M:add(data, size)
 	local record_batch, timestamp_delta, err = self.record_batch, 0
 
-	if record_batch.lock then -- TODO: iterate record_batch.next + timeout
-		return nil, ngx.log(ngx.ERR, "FAILED ADDING DATA, record locked: ", record_batch.id)
-	end
+  if record_batch.lock then
+    local batch, oldest
+
+    repeat
+      batch = (batch or record_batch).next
+      if not oldest or (batch.max_timestamp < oldest.max_timestamp) then
+        oldest = batch
+      end
+    until(batch == record_batch or not batch.lock)
+
+    if batch.lock then -- none was unlocked
+      if oldest.max_timestamp + self.max_timeout >= ngx.now() then
+        return
+        --return nil, ngx.log(ngx.ERR, "FAILED ADDING DATA, all records locked")
+      end
+
+      ngx.log(ngx.WARN, "Forced to clear batch: ", oldest.id)
+      batch, oldest.length, oldest.size, oldest.lock = oldest, 0, 0
+    else
+      ngx.log(ngx.NOTICE, "found unclocked batch")
+    end
+    record_batch, self.record_batch = batch, batch
+    ngx.log(ngx.ERR, "LENGTH: ", record_batch.length)
+  end
 
 	size = size or #data
 
@@ -208,7 +270,6 @@ function _M:add(data, size)
 	record_batch[idx], record_batch[idx + 1] = zstd:update(concat(record))
 
 	if record_batch.length >= self.batch_max_length then
-		record_batch[idx + 1], record_batch[idx + 2] = zstd:finalize()
 
 		return self:send()
 	end

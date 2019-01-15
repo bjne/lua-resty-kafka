@@ -28,14 +28,13 @@ end)())
 
 local function crc32c(buf, len, crc)
 	len = len or #buf
-	buf, crc = cast('const uint8_t*', buf), crc or 0
+	buf, crc = cast('const uint8_t*', buf), bnot(crc or 0)
 
 	for i=0,len-1 do
-		crc = bnot(crc)
-		crc = bnot(bxor(rshift(crc, 8), crc32_t[bxor(crc % 256, buf[i])]))
+		crc = bxor(rshift(crc, 8), crc32_t[bxor(crc % 256, buf[i])])
 	end
 
-	return crc
+	return bnot(crc)
 end
 
 assert(crc32c('123456789') == -486108541)
