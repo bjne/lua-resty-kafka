@@ -27,8 +27,7 @@ local crc32_t = ffi.new('const uint32_t[256]', (function()
 end)())
 
 local function crc32c(buf, len, crc)
-	len = len or #buf
-	buf, crc = cast('const uint8_t*', buf), bnot(crc or 0)
+	len, buf, crc = len or #buf, cast('const uint8_t*', buf), bnot(crc or 0)
 
 	for i=0,len-1 do
 		crc = bxor(rshift(crc, 8), crc32_t[bxor(crc % 256, buf[i])])

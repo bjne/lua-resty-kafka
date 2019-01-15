@@ -17,30 +17,94 @@ local response = require "kafka.response".new{
 	}
 }
 
-
 local concat = table.concat
 local char = string.char
 local byte = string.byte
+local sub = string.sub
 
 local _M = { _VERSION = 0.1 }
 local mt = { __index = _M }
 
-_M.stats = {
-  --[[
-  ["topic"] = {
-    npackets = int,
-    nbytes = int, -- uncompressed
-    comprate
-    
-    nrecords = int,
-
-    overflows = int, -- forced batch clear
-  }
-  --]]
-}
-
 local zstd -- must be initialized per worker (on add)
 local record = { [2] = char(0x00), [5] = char(0x01) } -- attributes, key_len
+local stat, worker_count = ngx.shared.kafka_stats, ngx.worker.count()
+local stat_incr, stat_rate = function()end, function()end
+
+local function get_free_record_batch(self)
+	local cur_record_batch = self.record_batch
+
+	if not cur_record_batch.lock then
+		return cur_record_batch
+	end
+
+	local old_record_batch, new_record_batch = cur_record_batch
+
+	while new_record_batch ~= cur_record_batch do
+		new_record_batch = (new_record_batch or cur_record_batch).next
+
+		if not new_record_batch.lock then
+			self.record_batch = new_record_batch
+
+			return new_record_batch
+		end
+
+		if new_record_batch.max_timestamp < old_record_batch.max_timestamp then
+			old_record_batch = new_record_batch
+		end
+	end
+
+	if old_record_batch.max_timestamp + self.max_timeout > ngx.now() then
+		return nil, stat_incr("record_batch not available")
+	end
+
+	old_record_batch.length, old_record_batch.size, old_record_batch.lock = 0, 0
+	self.record_batch = old_record_batch
+
+	return old_record_batch, stat_incr("record_batch timed out")
+end
+
+if stat then
+	local k = {}
+
+	local _key = function(key, div)
+		k[1],k[2],k[3] = k[1] or char(ngx.worker.id()), char(div or 1), key
+		return concat(k)
+	end
+
+	stat_rate = function(key, val)
+		if key then
+			key = _key(key, worker_count)
+			stat:set(key, tonumber((stat:get(key)) or val)/10*(10-1) + val/10)
+		end
+	end
+
+	stat_incr = function(key, val)
+		if key and val ~= 0 then
+			stat:incr(_key(key), val or 1, 0)
+		end
+	end
+end
+
+function _M.stats(worker)
+	if not stat then
+		return nil, "shared dictionary kafka_stats missing in configuration"
+	end
+
+	worker = worker and tonumber(worker)
+
+	local res, val, wrk, div = {}
+	for _, key in ipairs(stat:get_keys()) do
+		wrk, div = byte(key, 1, 2)
+		if wrk == (worker or wrk) then
+			key, val = sub(key, 3), stat:get(key)
+			res[key] = (res[key] or 0) + (val / (worker and 1 or div))
+		end
+	end
+
+	for k,v in pairs(res) do
+		ngx.say(k, "=", v)
+	end
+end
 
 function _M.new(config)
 	if not config.topic then
@@ -68,9 +132,7 @@ function _M.new(config)
 		zstd_compression_level = config.zstd_compression_level or 9,
 
 		offset = 8,
-    error_code_offset      = 4 + 4 + 2 + #config.topic + 4 + 4,
-
-    navg_samples      = config.navg_samples or 100
+		error_code_offset      = 4 + 4 + 2 + #config.topic + 4 + 4
 	}
 
 	local request_header, produce_header = {
@@ -125,29 +187,14 @@ function _M.new(config)
 		}
 	end
 
-  _M.stats[self.topic] = _M.stats[self.topic] or {
-    npackets = 0,
-    nbytes = 0,
-    nrecords = 0
-  }
-  self.s = _M.stats[self.topic]
-
 	return setmetatable(self, mt)
 end
 
-
 function _M:send()
-	local record_batch = self.record_batch
+	local record_batch, idx = self.record_batch
 
-	local idx = record_batch.length + self.offset
-  record_batch[idx + 1], record_batch[idx + 2] = zstd:finalize()
-
-	if record_batch.lock then -- TODO: possible to end here?
-		ngx.log(ngx.ERR, "record_batch is locked:", record_batch.id)
-		return nil, "record_batch is locked"
-	end
-
-	record_batch.lock = true
+	record_batch.lock, idx = true, record_batch.length + self.offset
+	record_batch[idx + 1], record_batch[idx + 2] = zstd:finalize()
 
 	record_batch[2] = encode.int32(record_batch.length - 1)
 	record_batch[3] = encode.int64(record_batch.first_timestamp)
@@ -158,11 +205,8 @@ function _M:send()
 
 	local size = #data + 9                    -- record batch header
 
-  -- compression rate
-  local x = self.navg_samples
-  local comprate = record_batch.size / (size - 40) / x
-  self.s.comprate = self.s.comprate or comprate * x
-  self.s.comprate = self.s.comprate / x * (x - 1) + comprate
+	stat_rate('compression ratio', (size - 40) / record_batch.size)
+	stat_rate('average records', record_batch.length)
 
 	pkt[01] = encode.int32(size + 12 + self.header_length)
 	pkt[06] = encode.int32(0)                 -- partition_id
@@ -172,75 +216,44 @@ function _M:send()
 	pkt[13] = data
 
 	ngx.timer.at(0, function(premature, record_batch)
-    local data, err
-    for i=1, 2 do
-      data, err = self.client:send(record_batch.pkt, 0, i==2)
+		local data, err
+		for i=1,2 do
+			data, err = self.client:send(record_batch.pkt, 0, i==2)
 
-      if not data then
-        if err then
-          self.s[err] = (self.s[err] or 0) + 1
-        end
-        break
-      end
+			if not data then
+				stat_incr(err)
+				break
+			end
 
-      local err_code = byte(data, self.error_code_offset+2)
+			err = byte(data, self.error_code_offset + 2)
 
-      if not (i == 1 and err_code == 6) then
-        err = err_code ~= 0 and err_code
-        break
-      end
+			if not (i == 1 and err == 6) then
+				stat_incr('error_code_' .. tostring(err), err == 0 and 0)
+				break
+			end
 		end
 
-    if err then
-      ngx.log(ngx.ERR, err)
-      --ngx.log(ngx.ERR, require"cjson".encode(response(data)))
-    end
-    self.s.npackets = self.s.npackets + 1
-    self.s.nbytes   = self.s.nbytes + record_batch.size
-    self.s.nrecords = self.s.nrecords + record_batch.length
+		stat_incr('npackets')
+		stat_incr('nbytes', record_batch.size)
+		stat_incr('nrecords', record_batch.length)
 
-		record_batch.length, record_batch.lock = 0
+		record_batch.length, record_batch.size, record_batch.lock = 0, 0
 	end, record_batch)
 
-
-
-  self.record_batch = record_batch.next
-  return true
+	return get_free_record_batch(self)
 end
 
-
 function _M:add(data, size)
-	local record_batch, timestamp_delta, err = self.record_batch, 0
+	local timestamp_delta, record_batch, err = 0, get_free_record_batch(self)
 
-  if record_batch.lock then
-    local batch, oldest
-
-    repeat
-      batch = (batch or record_batch).next
-      if not oldest or (batch.max_timestamp < oldest.max_timestamp) then
-        oldest = batch
-      end
-    until(batch == record_batch or not batch.lock)
-
-    if batch.lock then -- none was unlocked
-      if oldest.max_timestamp + self.max_timeout >= ngx.now() then
-        return
-        --return nil, ngx.log(ngx.ERR, "FAILED ADDING DATA, all records locked")
-      end
-
-      ngx.log(ngx.WARN, "Forced to clear batch: ", oldest.id)
-      batch, oldest.length, oldest.size, oldest.lock = oldest, 0, 0
-    else
-      ngx.log(ngx.NOTICE, "found unclocked batch")
-    end
-    record_batch, self.record_batch = batch, batch
-    ngx.log(ngx.ERR, "LENGTH: ", record_batch.length)
-  end
+	if not record_batch then
+		return nil, err
+	end
 
 	size = size or #data
 
 	if size + record_batch.size >= self.batch_max_size then
-		record_batch, err = self:send()
+		record_batch = self:send()
 
 		if not record_batch then
 			return nil, err
@@ -265,14 +278,12 @@ function _M:add(data, size)
 
 	record_batch.max_timestamp = record_batch.first_timestamp + timestamp_delta
 	record_batch.length = record_batch.length + 1
+	record_batch.size = record_batch.size + size
 
 	local idx = record_batch.length + self.offset
 	record_batch[idx], record_batch[idx + 1] = zstd:update(concat(record))
 
-	if record_batch.length >= self.batch_max_length then
-
-		return self:send()
-	end
+	return record_batch.length >= self.batch_max_length and self:send()
 end
 
 return _M
