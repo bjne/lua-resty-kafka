@@ -25,7 +25,6 @@ local sub = string.sub
 local _M = { _VERSION = 0.1 }
 local mt = { __index = _M }
 
-local zstd -- must be initialized per worker (on add)
 local record = { [2] = char(0x00), [5] = char(0x01) } -- attributes, key_len
 local stat, worker_count = ngx.shared.kafka_stats, ngx.worker.count()
 local stat_incr, stat_rate = function()end, function()end
@@ -194,11 +193,10 @@ function _M.new(config)
 		}
 	end
 
-	ngx.timer.every(self.flush_interval, function(_, self, record_batch)
-		if record_batch.first_timestamp + self.flush_interval < ngx.now() then
-			return self:send()
-		end
-	end, self, record_batch)
+	ngx.timer.every(self.flush_interval, function(premature, self)
+		local first_timestamp = self.record_batch.first_timestamp or math.huge
+		return first_timestamp + self.flush_interval < ngx.now() and self:send()
+	end, self)
 
 	return setmetatable(self, mt)
 end
@@ -211,7 +209,7 @@ function _M:send()
 	end
 
 	record_batch.lock, idx = true, record_batch.length + self.offset + 1
-	record_batch[idx] = zstd:finalize()
+	record_batch[idx] = self.zstd:finalize()
 
 	record_batch[2] = encode.int32(record_batch.length - 1)
 	record_batch[3] = encode.int64(record_batch.first_timestamp)
@@ -290,7 +288,7 @@ function _M:add(data, size)
 	if record_batch.length > 0 then
 		timestamp_delta = ngx.now() - record_batch.first_timestamp
 	else
-		zstd = zstd or zstandard.new(self.zstd_compression_level)
+		self.zstd = self.zstd or zstandard.new(self.zstd_compression_level)
 		timestamp_delta, record_batch.first_timestamp = 0, ngx.now()
 	end
 
@@ -298,7 +296,7 @@ function _M:add(data, size)
 	record_batch.length = record_batch.length + 1
 	record_batch.size = record_batch.size + size
 
-	record_batch[record_batch.length + self.offset] = zstd:update(record)
+	record_batch[record_batch.length + self.offset] = self.zstd:update(record)
 
 	return record_batch.length >= self.batch_length and self:send()
 end
