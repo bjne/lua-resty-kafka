@@ -36,6 +36,5 @@ local function crc32c(buf, len, crc)
 	return bnot(crc)
 end
 
-assert(crc32c('123456789') == -486108541)
 
-return crc32c
+return crc32, assert(crc32c('123456789') == -486108541)
