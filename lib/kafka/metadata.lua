@@ -1,5 +1,21 @@
 local encode = require "kafka.encode"
-local response = require "kafka.response".new{
+local decode = require "kafka.decode"
+
+local concat = table.concat
+
+local leaders, empty_table = {}, {}
+local pkt = {
+	[1] = nil,                      -- size
+	[2] = string.char(0x00, 0x03),  -- api_key
+	[3] = string.char(0x00, 0x07),  -- api_version
+	[4] = string.char(0,0,0,0),     -- correlation_id
+	[5] = nil,                      -- client_id
+	[6] = string.char(0,0,0,1),     -- ntopics
+	[7] = nil,                      -- topic_1
+	[8] = string.char(0x01)         -- allow_auto_topic_creation
+}
+
+local response = decode.response{
 	"int32:throttle_time_ms",
 	"array:brokers", {
 		"int32:node_id",
@@ -31,70 +47,47 @@ local response = require "kafka.response".new{
 	}
 }
 
-local empty_table, pkt = {}, {
-	[1] = nil,                     -- size
-	[2] = string.char(0x00, 0x03), -- api_key
-	[3] = string.char(0x00, 0x07), -- api_version
-	[4] = string.char(0,0,0,0),    -- correlation_id
-	[5] = nil,                     -- client_id
-	[6] = string.char(0,0,0,1),    -- ntopics
-	[7] = nil,                     -- topic_1
-	[8] = string.char(0x01)        -- allow_auto_topic_creation
-}
+return function(client, topic, partition, refresh)
+	-- todo: dont return nil (must return table)
 
-local _M = {}
-local mt = {
-	__index = {
-		refresh = function(self, partition)
-			local data, err = self.client:send(self.pkt)
-			if not data then
-				return nil, err
-			end
-
-			data, err = response(data)
-			if not data then
-				return nil, err
-			end
-
-			local brokers, leaders, topic = {}, {}, data.topic_metadata[1]
-			for _,broker in ipairs(data.brokers) do
-				brokers[broker.node_id] = broker
-			end
-
-			for _,partition in ipairs(topic.partition_metadata) do
-				leaders[partition.partition] = {brokers[partition.leader]}
-			end
-
-			self.leaders = leaders
-
-			return partition and (leaders[partition] or empty_table)
-		end
-	},
-	__call = function(self, part, refresh)
-		return (refresh or not self.leaders[part]) and self:refresh(part)
-			or (self.leaders[part] or empty_table)
-	end
-}
-
-
-_M.new = function(config, client)
 	if not client then
 		return nil, "client must be passed"
-	elseif not config.client_id then
+	elseif not client.client_id then
 		return nil, "client_id missing"
-	elseif not config.topic then
+	elseif not topic then
 		return nil, "topic missing"
+	elseif not partition then
+		return nil, "partition missing"
 	end
 
-	pkt[1] = encode.int32(17 + #config.client_id + #config.topic)
-	pkt[5] = encode.string(config.client_id)
-	pkt[7] = encode.string(config.topic)
+	if not refresh and leaders[topic] and leaders[topic][partition] then
+		return leaders[topic][partition]
+	end
 
-	return setmetatable({
-		client = client,
-		leaders = {},
-		pkt = table.concat(pkt)
-	}, mt)
+	pkt[1] = encode.int32(8 + 2 + #client.client_id + 4 + 2 + #topic + 1)
+	pkt[5] = encode.string(client.client_id)
+	pkt[7] = encode.string(topic)
+
+	local data, err = client:send(concat(pkt))
+	if not data then
+		return nil, err
+	end
+
+	data, err = response(data)
+	if not data then
+		return nil, err
+	end
+
+	leaders[topic] = leaders[topic] or {}
+
+	local brokers, _topic = {}, data.topic_metadata[1]
+	for _,broker in ipairs(data.brokers) do
+		brokers[broker.node_id] = broker
+	end
+
+	for _,partition in ipairs(_topic.partition_metadata) do
+		leaders[topic][partition.partition] = {brokers[partition.leader]}
+	end
+
+	return leaders[topic][partition] or empty_table
 end
-
-return _M

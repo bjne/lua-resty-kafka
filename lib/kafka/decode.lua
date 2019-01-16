@@ -3,6 +3,9 @@ local match = string.match
 local insert = table.insert
 local concat = table.concat
 
+local bor = bit.bor
+local lshift = bit.lshift
+
 local _M = {}
 
 local default_header = {"int32:correlation_id"}
@@ -78,8 +81,12 @@ local function generate_parser(...)
 	return loadstring(concat(code, "\n"))()
 end
 
-function _M.new(...)
+function _M.response(...)
 	return generate_parser(default_header, ...)
+end
+
+function _M.int32(a,b,c,d)
+	return bor(lshift(a, 24), lshift(b, 16), lshift(c, 8), d)
 end
 
 return _M

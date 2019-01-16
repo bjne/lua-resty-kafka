@@ -3,7 +3,20 @@ local crc32c = require "kafka.crc32c"
 local encode = require "kafka.encode"
 local new_tab = require "table.new"
 local zstandard = require "kafka.zstd"
-local response = require "kafka.response".new{
+local decode = require "kafka.decode"
+
+local concat = table.concat
+local char = string.char
+local byte = string.byte
+local sub = string.sub
+
+local at = ngx.timer.at
+
+local _M = { _VERSION = 0.1 }
+local mt = { __index = _M }
+
+--[[
+local response = decode.response{
 	"array:response", { 
 		"string:topic",
 		"array:partition", {
@@ -16,19 +29,17 @@ local response = require "kafka.response".new{
 		"int32:throttle_time_ms"
 	}
 }
-
-local concat = table.concat
-local char = string.char
-local byte = string.byte
-local sub = string.sub
-
-local _M = { _VERSION = 0.1 }
-local mt = { __index = _M }
+--]]
 
 local record = { [2] = char(0x00), [5] = char(0x01) } -- attributes, key_len
 local stat, worker_count = ngx.shared.kafka_stats, ngx.worker.count()
 local stat_incr, stat_rate = function()end, function()end
 
+local master_worker, pkt_queue = {}, ngx.shared.kafka_queue
+
+local function int32(a,b,c,d)
+	return bor(lshift(a, 24), lshift(b, 16), lshift(c, 8), d)
+end
 
 local function get_free_record_batch(self)
 	local cur_record_batch = self.record_batch
@@ -61,6 +72,33 @@ local function get_free_record_batch(self)
 	self.record_batch = old_record_batch
 
 	return old_record_batch, stat_incr("record_batch timed out")
+end
+
+local function send_pkt(premature, pkt, client, topic, partition, record_batch)
+	local data, err
+	for i=1,2 do
+		data, err = client:send(pkt, topic, partition, i==2)
+
+		if not data then
+			stat_incr(err)
+			break
+		end
+
+		err = byte(data, 4 + 4 + 2 + #topic + 4 + 4 + 2)
+
+		if not (i == 1 and err == 6) then
+			stat_incr('error_code_' .. tostring(err), err == 0 and 0)
+			break
+		end
+
+		err = nil
+	end
+
+	if record_batch then
+		record_batch.length, record_batch.size, record_batch.lock = 0, 0
+	end
+
+	return err and nil, err
 end
 
 if stat then
@@ -111,9 +149,8 @@ function _M.new(config)
 		return nil, "no topic supplied"
 	end
 
-	config.client_id = config.client_id or 'ngx'
-
 	local client, err = client.new(config)
+
 	if not client then
 		return nil, err
 	end
@@ -135,8 +172,7 @@ function _M.new(config)
 		zstd_compression_level = config.zstd_compression_level or 9,
 		flush_interval         = config.flush_interval or 2,
 
-		offset = 8,
-		error_code_offset      = 4 + 4 + 2 + #config.topic + 4 + 4
+		offset = 8
 	}
 
 	if type(config.partition or 0) == "number" then
@@ -144,7 +180,7 @@ function _M.new(config)
 	end
 
 	-- (request_header) + (produce_header)
-	self.header_length = (10 + #self.client_id) + (26 + #self.topic)
+	self.header_length = (10 + #client.client_id) + (26 + #self.topic)
 
 	local record_batch_1, record_batch
 	for i=1, self.batch_num do
@@ -170,7 +206,7 @@ function _M.new(config)
 			         char(0x00, 0x00),                 -- api_key
 			         char(0x00, 0x07),                 -- api_version
 			         char(0,0,0,0),                    -- correlation_id
-			         encode.string(self.client_id)     -- client_id
+			         encode.string(client.client_id)   -- client_id
 			       },
 			[03] = concat{
 			         encode.string(""),                -- transaction_id
@@ -219,42 +255,31 @@ function _M:send()
 	data, pkt = concat(record_batch, "", 1, idx), record_batch.pkt
 	size = #data + 9
 
-	stat_rate('compression ratio', record_batch.size / (size - 49))
-	stat_rate('average records', record_batch.length)
-
+	local partition = self.partition(record_batch)
 	pkt[01] = encode.int32(size + 12 + self.header_length)
-	pkt[06] = self.partition(record_batch)    -- partition_id
+	pkt[06] = encode.int32(partition)         -- partition_id
 	pkt[07] = encode.int32(size + 12)         -- messageset size
 	pkt[09] = encode.int32(size)              -- record batch length
 	pkt[12] = encode.int32(crc32c(data))
 	pkt[13] = data
 
-	ngx.timer.at(0, function(premature, record_batch)
-		local partition, data, err = record_batch.pkt[06]
-		record_batch.pkt[06] = encode.int32(partition)
+	stat_rate('compression ratio', record_batch.size / (size - 49))
+	stat_rate('average records', record_batch.length)
 
-		for i=1,2 do
-			data, err = self.client:send(record_batch.pkt, partition, i==2)
+	stat_incr('npackets')
+	stat_incr('nbytes', record_batch.size)
+	stat_incr('nrecords', record_batch.length)
 
-			if not data then
-				stat_incr(err)
-				break
-			end
-
-			err = byte(data, self.error_code_offset + 2)
-
-			if not (i == 1 and err == 6) then
-				stat_incr('error_code_' .. tostring(err), err == 0 and 0)
-				break
-			end
+	if pkt_queue and not master_worker[self.topic] then
+		npkt, err = pkt_queue:rpush(self.topic, concat(pkt))
+		if err then
+			stat_incr('pkt_queue_error_' .. err)
 		end
 
-		stat_incr('npackets')
-		stat_incr('nbytes', record_batch.size)
-		stat_incr('nrecords', record_batch.length)
-
 		record_batch.length, record_batch.size, record_batch.lock = 0, 0
-	end, record_batch)
+	else
+		at(0, send_pkt, pkt, self.client, self.topic, partition, record_batch)
+	end
 
 	return get_free_record_batch(self)
 end
@@ -299,6 +324,45 @@ function _M:add(data, size)
 	record_batch[record_batch.length + self.offset] = self.zstd:update(record)
 
 	return record_batch.length >= self.batch_length and self:send()
+end
+
+function _M.worker(config)
+	if not pkt_queue then
+		return nil, "shared dictionary kafka_queue missing in configuration"
+	end
+
+	local topic = config.topic
+
+	if not topic then
+		return nil, "topic must be defined for worker"
+	end
+
+	local client, err = client.new(config)
+
+	if not client then
+		return nil, err
+	end
+
+	master_worker[topic] = {}
+
+	local topic_offset = 2 + 2 + 4 + 4 + 2 + #topic + 4 + 1
+
+	-- TODO: send with multiple light-threads
+	return at(0, function(premature, client)
+		local int32, pkt, offset, partition = decode.int32
+		while true do
+			pkt, err = pkt_queue:lpop(topic)
+
+			if pkt then
+				offset = byte(pkt, 14) + 14 + topic_offset
+				partition = int32(byte(pkt, offset, offset + 3))
+
+				send_pkt(nil, pkt, client, topic, partition)
+			else
+				ngx.sleep(0.1)
+			end
+		end
+	end, client)
 end
 
 return _M

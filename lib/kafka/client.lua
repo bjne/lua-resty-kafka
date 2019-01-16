@@ -1,10 +1,13 @@
 local metadata = require "kafka.metadata"
+local decode = require "kafka.decode"
 
 local tcp = ngx.socket.tcp
 local lshift = bit.lshift
 local bor = bit.bor
 local byte = string.byte
 local lower = string.lower
+local concat = table.concat
+local int32 = decode.int32
 
 local _M = {}
 local mt = { __index = _M }
@@ -13,7 +16,7 @@ local etc_hosts = {}
 for line in io.lines("/etc/hosts") do
 	local ip, hosts = string.match(line, '(%d+%.%d+%.%d+%.%d+)%s+(.*)$')
 	string.gsub(hosts or '', '(%S+)', function(host)
-		etc_hosts[string.lower(host)] = ip
+		etc_hosts[lower(host)] = ip
 	end)
 end
 
@@ -27,7 +30,7 @@ local function _request(pkt, host, port)
 
 	data, err = sock:send(pkt)
 	if not data then
-		ngx.log(ngx.ERR, err)
+		return nil, err
 	end
 
 	data, err = sock:receive(4)
@@ -35,9 +38,7 @@ local function _request(pkt, host, port)
 		return nil, err
 	end
 
-	local a,b,c,d = byte(data, 1, 4)
-
-	data, err = sock:receive(bor(lshift(a, 24), lshift(b, 16), lshift(c, 8), d))
+	data, err = sock:receive(int32(byte(data, 1, 4)))
 	if not data then
 		return nil, err
 	end
@@ -46,28 +47,22 @@ local function _request(pkt, host, port)
 end
 
 function _M.new(config)
-	config.broker_list = config.broker_list or {
-		{host = "127.0.0.1", port = 9092}
-	}
-
-	if type(config.broker_list) ~= "table" then
+	if config.broker_list and type(config.broker_list) ~= "table" then
 		return nil, "broker_list is not table"
 	end
 
-	local client, err = { broker_list = config.broker_list }
-
-	client.metadata, err = metadata.new(config, client)
-	if not client.metadata then
-		return nil, err
-	end
+	local client, err = {
+		client_id = config.client_id or 'ngx',
+		broker_list = config.broker_list or {{host = "127.0.0.1", port = 9092}}
+	}
 
 	return setmetatable(client, mt)
 end
 
-function _M:send(pkt, partition, refresh)
-	local broker_list, response, err = partition == nil and self.broker_list
+function _M:send(pkt, topic, ...)
+	local broker_list, response, err = topic == nil and self.broker_list
 
-	for _,broker in ipairs(broker_list or self.metadata(partition, refresh)) do
+	for _,broker in ipairs(broker_list or metadata(self, topic, ...)) do
 		response, err = _request(pkt, broker.host, broker.port)
 		if response then
 			return response
