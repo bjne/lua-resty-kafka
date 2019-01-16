@@ -15,7 +15,6 @@ typedef struct ZSTD_inBuffer_s {
 	size_t pos;         /* position where reading stopped. Will be updated. */
 } ZSTD_inBuffer;
 
-
 typedef struct ZSTD_outBuffer_s {
 	void*  dst;         /* start of output buffer */
 	size_t size;        /* size of output buffer */
@@ -74,6 +73,7 @@ function _M:update(data, size)
 	local buf, buf_size, it, rlen = self.buf, self.buf_size, 0
 
 	if data then
+		data = type(data) == "table" and concat(data) or data
 		input = zstd_inbuffer()
 		input[0].src, input[0].size, input[0].pos = data, size or #data, 0
 	end
