@@ -30,6 +30,8 @@ local record = { [2] = char(0x00), [5] = char(0x01) } -- attributes, key_len
 local stat, worker_count = ngx.shared.kafka_stats, ngx.worker.count()
 local stat_incr, stat_rate = function()end, function()end
 
+
+
 local function get_free_record_batch(self)
 	local cur_record_batch = self.record_batch
 
@@ -118,11 +120,13 @@ function _M.new(config)
 		return nil, err
 	end
 
+
 	local self = {
 		client                 = client,
 
 		topic                  = config.topic,
 		client_id              = config.client_id,
+		partition							 = config.partition,
 
 		batch_num              = config.batch_num or 4,
 		batch_size             = config.batch_size or 1024 * 1024,
@@ -132,10 +136,16 @@ function _M.new(config)
 		timeout                = config.timeout or 1500,
 		max_timeout            = config.max_timeout or 2000,
 		zstd_compression_level = config.zstd_compression_level or 9,
+		flush_interval				 = config.flush_interval or 2,
 
 		offset = 8,
 		error_code_offset      = 4 + 4 + 2 + #config.topic + 4 + 4
 	}
+
+	if type(config.partition or 0) == "number" then
+		self.partition = function() return config.partition or 0 end
+	end
+	ngx.log(ngx.ERR, "partition: ", self.partition())
 
 	local request_header, produce_header = {
 		char(0x00, 0x00),                    -- api_key
@@ -172,8 +182,8 @@ function _M.new(config)
 
 		record_batch.size, record_batch.length, record_batch.pkt = 0, 0, {
 			[01] = nil,                       -- size (int32),
-			[02] = request_header,
-			[03] = produce_header,
+			[02] = concat(request_header),
+			[03] = concat(produce_header),
 			[04] = encode.string(self.topic), -- config.topic
 			[05] = encode.int32(1),           -- num_partitions
 			[06] = nil,                       -- partition_id (int32)
@@ -189,11 +199,23 @@ function _M.new(config)
 		}
 	end
 
+
+	local hdl, err = ngx.timer.every(self.flush_interval,
+		function(premature, self)
+			local first_timestamp = self.record_batch.first_timestamp or math.huge
+			return first_timestamp + self.flush_interval <= ngx.now() and self:send()
+		end,
+	self)
+
 	return setmetatable(self, mt)
 end
 
 function _M:send()
 	local record_batch, idx = self.record_batch
+
+	if record_batch.lock or record_batch.length == 0 then
+		return
+	end
 
 	record_batch.lock, idx = true, record_batch.length + self.offset
 	record_batch[idx + 1], record_batch[idx + 2] = zstd:finalize()
@@ -203,24 +225,31 @@ function _M:send()
 	record_batch[4] = encode.int64(record_batch.max_timestamp)
 	record_batch[8] = encode.int32(record_batch.length)
 
-	local pkt, data = record_batch.pkt, concat(record_batch)
+	local pkt, data = record_batch.pkt, concat(record_batch, "", 1, record_batch.length + self.offset + 1)
 
+	--local pkt, data = record_batch.pkt, concat(record_batch)
 	local size = #data + 9                    -- record batch header
 
-	stat_rate('compression ratio', (size - 40) / record_batch.size)
+	stat_rate('compression ratio', record_batch.size / (size - 49))
 	stat_rate('average records', record_batch.length)
 
+
+	--local partition = self.partition(record_batch)
+
 	pkt[01] = encode.int32(size + 12 + self.header_length)
-	pkt[06] = encode.int32(0)                 -- partition_id
+	pkt[06] = self.partition(record_batch)    -- partition_id
 	pkt[07] = encode.int32(size + 12)         -- messageset size
 	pkt[09] = encode.int32(size)              -- record batch length
 	pkt[12] = encode.int32(crc32c(data))
 	pkt[13] = data
 
 	ngx.timer.at(0, function(premature, record_batch)
-		local data, err
+		local partition, data, err = record_batch.pkt[06]
+		record_batch.pkt[06] = encode.int32(partition)
+
 		for i=1,2 do
-			data, err = self.client:send(record_batch.pkt, 0, i==2)
+
+			data, err = self.client:send(record_batch.pkt, partition, i==2)
 
 			if not data then
 				stat_incr(err)
@@ -254,6 +283,16 @@ function _M:add(data, size)
 
 	size = size or #data
 
+	record[7], size = data, size
+	record[6], size = encode.varint(size, size)
+	record[4], size = encode.varint(record_batch.length, size)
+	record[3], size = encode.varint(timestamp_delta, size)
+	-- header_length
+	record[8], size = char(0x00), size + 1
+	-- size + key_length + attributes
+	record[1], size = encode.varint(size + 2, size + 2)
+
+
 	if size + record_batch.size >= self.batch_size then
 		record_batch = self:send()
 
@@ -268,15 +307,6 @@ function _M:add(data, size)
 		zstd = zstd or zstandard.new(self.zstd_compression_level)
 		timestamp_delta, record_batch.first_timestamp = 0, ngx.now()
 	end
-
-	record[7], size = data, size
-	record[6], size = encode.varint(size, size)
-	record[4], size = encode.varint(record_batch.length, size)
-	record[3], size = encode.varint(timestamp_delta, size)
-	-- header_length
-	record[8], size = char(0x00), size + 1
-	-- size + key_length + attributes
-	record[1], size = encode.varint(size + 2, size + 2)
 
 	record_batch.max_timestamp = record_batch.first_timestamp + timestamp_delta
 	record_batch.length = record_batch.length + 1
