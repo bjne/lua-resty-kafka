@@ -120,12 +120,14 @@ function _M.new(config)
 
 	local self = {
 		client                 = client,
-		topic                  = config.topic,
 
+		topic                  = config.topic,
 		client_id              = config.client_id,
-		max_packets            = config.max_packets or 2,
-		batch_max_size         = config.batch_max_size or 2000,
-		batch_max_length       = config.batch_max_length or 50,
+
+		batch_num              = config.batch_num or 4,
+		batch_size             = config.batch_size or 1024 * 1024,
+		batch_length           = config.batch_length or 1000,
+
 		required_acks          = config.required_acks or 1,
 		timeout                = config.timeout or 1500,
 		max_timeout            = config.max_timeout or 2000,
@@ -151,8 +153,8 @@ function _M.new(config)
 	self.header_length = (10 + #self.client_id) + (26 + #self.topic)
 
 	local record_batch_1, record_batch
-	for i=1, self.max_packets do
-		local r = new_tab(self.offset + self.batch_max_length + 1 + 1, 5)
+	for i=1, self.batch_num do
+		local r = new_tab(self.offset + self.batch_length + 1 + 1, 5)
 
 		if not record_batch then
 			record_batch, record_batch_1, self.record_batch = r, r, r
@@ -160,7 +162,7 @@ function _M.new(config)
 			record_batch.next = r
 			record_batch = record_batch.next
 
-			record_batch.next = i == self.max_packets and record_batch_1
+			record_batch.next = i == self.batch_num and record_batch_1
 		end
 
 		record_batch[1] = encode.int16(4)    -- attributes (zstd)
@@ -252,7 +254,7 @@ function _M:add(data, size)
 
 	size = size or #data
 
-	if size + record_batch.size >= self.batch_max_size then
+	if size + record_batch.size >= self.batch_size then
 		record_batch = self:send()
 
 		if not record_batch then
@@ -283,7 +285,7 @@ function _M:add(data, size)
 	local idx = record_batch.length + self.offset
 	record_batch[idx], record_batch[idx + 1] = zstd:update(concat(record))
 
-	return record_batch.length >= self.batch_max_length and self:send()
+	return record_batch.length >= self.batch_length and self:send()
 end
 
 return _M
