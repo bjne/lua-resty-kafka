@@ -9,6 +9,8 @@ local concat = table.concat
 local char = string.char
 local byte = string.byte
 local sub = string.sub
+local format = string.format
+local gmatch = string.gmatch
 
 local at = ngx.timer.at
 
@@ -33,7 +35,7 @@ local response = decode.response{
 
 local record = { [2] = char(0x00), [5] = char(0x01) } -- attributes, key_len
 local stat, worker_count = ngx.shared.kafka_stats, ngx.worker.count()
-local stat_incr, stat_rate = function()end, function()end
+local stat_incr, stat_rate, stat_err = function()end,function()end,function()end
 
 local master_worker, pkt_queue = {}, ngx.shared.kafka_queue
 
@@ -65,13 +67,13 @@ local function get_free_record_batch(self)
 	end
 
 	if old_record_batch.max_timestamp + self.max_timeout > ngx.now() then
-		return nil, stat_incr("record_batch not available")
+		return nil, stat_err("get record: " .. "record batch not available")
 	end
 
 	old_record_batch.length, old_record_batch.size, old_record_batch.lock = 0, 0
 	self.record_batch = old_record_batch
 
-	return old_record_batch, stat_incr("record_batch timed out")
+	return old_record_batch, stat_err("record batch timed out")
 end
 
 local function send_pkt(premature, pkt, client, topic, partition, record_batch)
@@ -80,14 +82,14 @@ local function send_pkt(premature, pkt, client, topic, partition, record_batch)
 		data, err = client:send(pkt, topic, partition, i==2)
 
 		if not data then
-			stat_incr(err)
+			stat_err(err)
 			break
 		end
 
 		err = byte(data, 4 + 4 + 2 + #topic + 4 + 4 + 2)
 
-		if not (i == 1 and err == 6) then
-			stat_incr('error_code_' .. tostring(err), err == 0 and 0)
+		if not (i == 1 and err == 6) and err ~= 0 then
+			stat_err("send_pkt failed with error_code: " .. tostring(err))
 			break
 		end
 
@@ -104,43 +106,46 @@ end
 if stat then
 	local k = {}
 
-	local _key = function(key, div)
-		k[1],k[2],k[3] = k[1] or char(ngx.worker.id()), char(div or 1), key
+	local _key = function(key, typ)
+		k[1],k[2],k[3] = k[1] or char(ngx.worker.id()), char(typ or 0), key
 		return concat(k)
-	end
-
-	stat_rate = function(key, val)
-		if key then
-			key = _key(key, worker_count)
-			stat:set(key, tonumber((stat:get(key)) or val)/10*(10-1) + val/10)
-		end
 	end
 
 	stat_incr = function(key, val)
 		if key and val ~= 0 then
-			stat:incr(_key(key), val or 1, 0)
+			stat:incr(_key(key, 0), val or 1, 0)
+		end
+	end
+
+	stat_err = function(key)
+		if key then
+			stat:incr(_key(key, 1), 1, 0)
 		end
 	end
 end
 
-function _M.stats(worker)
+function _M.prometheus(worker)
 	if not stat then
 		return nil, "shared dictionary kafka_stats missing in configuration"
 	end
 
 	worker = worker and tonumber(worker)
 
-	local res, val, wrk, div = {}
-	for _, key in ipairs(stat:get_keys()) do
-		wrk, div = byte(key, 1, 2)
-		if wrk == (worker or wrk) then
-			key, val = sub(key, 3), stat:get(key)
-			res[key] = (res[key] or 0) + (val / (worker and 1 or div))
-		end
-	end
+	ngx.say("# TYPE kafka_error counter")
+	for _, _key in ipairs(stat:get_keys()) do
+		local wrk, typ = byte(_key, 1, 2)
+		local key, val = sub(_key, 3), format("%d", stat:get(_key))
 
-	for k,v in pairs(res) do
-		ngx.say(k, "=", v)
+		if typ == 1 then
+			ngx.say('kafka_error{msg="', key, '" worker="', wrk, '"} ', val)
+		elseif typ == 0 then
+			ngx.say("# TYPE kafka_", key, " ", "counter")
+			ngx.say("kafka_", key, '{worker="', wrk, '"} ', val)
+		end
+
+		if tonumber(val) > 2^52 then
+			stat:set(_key, 0)
+		end
 	end
 end
 
@@ -263,17 +268,14 @@ function _M:send()
 	pkt[12] = encode.int32(crc32c(data))
 	pkt[13] = data
 
-	stat_rate('compression ratio', record_batch.size / (size - 49))
-	stat_rate('average records', record_batch.length)
-
+	stat_incr('nrecords', record_batch.length)
 	stat_incr('npackets')
 	stat_incr('nbytes', record_batch.size)
-	stat_incr('nrecords', record_batch.length)
 
 	if pkt_queue and not master_worker[self.topic] then
 		npkt, err = pkt_queue:rpush(self.topic, concat(pkt))
 		if err then
-			stat_incr('pkt_queue_error_' .. err)
+			stat_err("pkt_queue: " .. err)
 		end
 
 		record_batch.length, record_batch.size, record_batch.lock = 0, 0
