@@ -10,7 +10,6 @@ local char = string.char
 local byte = string.byte
 local sub = string.sub
 local format = string.format
-local gmatch = string.gmatch
 
 local at = ngx.timer.at
 
@@ -19,7 +18,7 @@ local mt = { __index = _M }
 
 --[[
 local response = decode.response{
-	"array:response", { 
+	"array:response", {
 		"string:topic",
 		"array:partition", {
 			"int32:id",
@@ -38,10 +37,6 @@ local stat, worker_count = ngx.shared.kafka_stats, ngx.worker.count()
 local stat_incr, stat_rate, stat_err = function()end,function()end,function()end
 
 local master_worker, pkt_queue = {}, ngx.shared.kafka_queue
-
-local function int32(a,b,c,d)
-	return bor(lshift(a, 24), lshift(b, 16), lshift(c, 8), d)
-end
 
 local function get_free_record_batch(self)
 	local cur_record_batch = self.record_batch
@@ -88,7 +83,12 @@ local function send_pkt(premature, pkt, client, topic, partition, record_batch)
 
 		err = byte(data, 4 + 4 + 2 + #topic + 4 + 4 + 2)
 
-		if not (i == 1 and err == 6) and err ~= 0 then
+		if err == 0 then
+			break
+		end
+
+		-- err == 6 -> incorrect_broker, will be refreshed when i=2
+		if not (i == 1 and err == 6) then
 			stat_err("send_pkt failed with error_code: " .. tostring(err))
 			break
 		end
@@ -273,7 +273,7 @@ function _M:send()
 	stat_incr('nbytes', record_batch.size)
 
 	if pkt_queue and not master_worker[self.topic] then
-		npkt, err = pkt_queue:rpush(self.topic, concat(pkt))
+		local npkt, err = pkt_queue:rpush(self.topic, concat(pkt))
 		if err then
 			stat_err("pkt_queue: " .. err)
 		end
